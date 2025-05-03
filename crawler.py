@@ -38,135 +38,197 @@ async def request_handler(context: PlaywrightCrawlingContext) -> None:
     print(f"Error processing {url}: {e}")
     update_local_query_status(url, Status.FAILED.value)
 
+
 async def process_business(context: PlaywrightCrawlingContext) -> dict:
-  page = context.page
-  url = context.request.url
+    page = context.page
+    url = context.request.url
 
-  # Title
-  title_el = await page.query_selector("h1")
-  title = await title_el.inner_text() if title_el else None
+    # Scroll to load all content
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(2000)
 
-  # Reviews
-  review_el = await page.query_selector("div.F7nice")
-  review_text = await review_el.inner_text() if review_el else ""
-  if review_text:
-    star = float(review_text.split("(")[0].strip() or 0)
-    review_text = review_text.replace(',', '').strip() if "," in review_text else review_text
-    review_count = int(review_text.split("(")[1].split(")")[0]) if "(" in review_text and ")" in review_text else 0
-  else:
-    star = None
-    review_count = None
+    # Title
+    title_el = await page.query_selector("h1")
+    title = await title_el.inner_text() if title_el else None
 
-  # Headline
-  headline_el = await page.query_selector("div[aria-label*='About'] div[jslog*='metadata']")
-  headline = await headline_el.inner_text() if headline_el else ""
-  
-  # Category
-  category_el = await page.query_selector("button.DkEaL")
-  category = await category_el.inner_text() if category_el else None
-  
-  # Address
-  address_el = await page.query_selector("button[data-item-id='address']")
-  address = await address_el.get_attribute("aria-label") if address_el else ""
-  address = address.replace("Address: ", "")
-  
-  # Open Hours
-  open_hours_el = await page.query_selector("div[aria-label*='Sunday']")
-  open_hours = await open_hours_el.get_attribute("aria-label") if open_hours_el else None
-  
-  # Check-in Info
-  check_in_el = await page.query_selector("div[data-item-id='place-info-links:'] .Io6YTe")
-  check_in = await check_in_el.inner_text() if check_in_el else None
-  
-  # Booking Link
-  book_el = await page.query_selector("a.M77dve")
-  book = await book_el.get_attribute("href") if book_el else None
+    # Star rating & review count
+    review_el = await page.query_selector("div.F7nice")
+    star, review_count = None, None
+    if review_el:
+        review_text = await review_el.inner_text()
+        parts = review_text.split('(')
+        if len(parts) >= 1:
+            try:
+                star = float(parts[0].strip())
+            except:
+                pass
+        if len(parts) > 1:
+            try:
+                review_count = int(parts[1].replace(')', '').replace(',', '').strip().split(' ')[0])
+            except:
+                pass
 
-  # Website
-  website_el = await page.query_selector("a[data-item-id='authority']")
-  website = await website_el.get_attribute("href") if website_el else None
-  
-  # Phone
-  phone_el = await page.query_selector("button[aria-label*='Phone']")
-  phone = await phone_el.inner_text() if phone_el else None
-  phone = re.sub(r'^[^+]*', '', phone).strip() if phone else None
-  
-  # Pluscode
-  pluscode_el = await page.query_selector("button[aria-label*='Plus code']")
-  pluscode = await pluscode_el.inner_text() if pluscode_el else None
+    # Headline
+    headline_el = await page.query_selector("div[aria-label*='About'] div[jslog*='metadata']")
+    headline = await headline_el.inner_text() if headline_el else ""
 
-  # About
-  # about = await process_about(page)
+    # Category
+    category_el = await page.query_selector("button.DkEaL")
+    category = await category_el.inner_text() if category_el else None
 
-  # Reviews
-  # reviews = await process_reviews(context)
+    # Address
+    address_el = await page.query_selector("button[data-item-id='address']")
+    address = await address_el.get_attribute("aria-label") if address_el else ""
+    address = address.replace("Address: ", "") if address else ""
 
-  # Coordinates
-  coordinates = parse_coordinate_from_map_url(url)
+    # Phone
+    phone_el = await page.query_selector("button[aria-label*='Phone']")
+    phone = await phone_el.inner_text() if phone_el else None
+    phone = re.sub(r'^[^+]*', '', phone).strip() if phone else None
 
-  return {
-    'url': url,
-    'title': title,
-    'star': star,
-    'review_count': review_count,
-    'headline': headline,
-    'category': category,
-    'address': address,
-    'open_hours': open_hours,
-    'check_in': check_in,
-    'book': book,
-    'website': website,
-    'phone': phone,
-    'pluscode': pluscode,
-    # 'reviews': reviews,
-    # 'about': about,
-    'coordinates': coordinates
-  }
+    # Website
+    website_el = await page.query_selector("a[data-item-id='authority']")
+    website = await website_el.get_attribute("href") if website_el else None
+
+    # Plus Code
+    pluscode_el = await page.query_selector("button[aria-label*='Plus code']")
+    pluscode = await pluscode_el.inner_text() if pluscode_el else None
+
+    # Booking Link
+    book_el = await page.query_selector("a.M77dve")
+    book = await book_el.get_attribute("href") if book_el else None
+
+    # Check-in Info
+    check_in_el = await page.query_selector("div[data-item-id='place-info-links:'] .Io6YTe")
+    check_in = await check_in_el.inner_text() if check_in_el else None
+
+    # Open Hours
+    open_hours = {}
+    open_hours_el = await page.query_selector("div[aria-label*='Open']")
+    if open_hours_el:
+        open_hours_label = await open_hours_el.get_attribute("aria-label")
+        if open_hours_label:
+            lines = open_hours_label.strip().split('\n')
+            for line in lines:
+                if ':' in line:
+                    day, time = line.split(':', 1)
+                    open_hours[day.strip()] = time.strip()
+
+    # Coordinates
+    coordinates = parse_coordinate_from_map_url(url)
+
+    # Photos
+    photos = []
+    photo_section = await page.query_selector_all("div[role='listitem'] img[srcset]")
+    for img in photo_section:
+        src = await img.get_attribute("src")
+        if src and "lh3.googleusercontent.com" in src:
+            photos.append(src)
+
+    # Cover Photo
+    cover_photo = photos[0] if photos else ""
+
+    # About Section / Attributes
+    about_data = await process_about(page)
+
+    # Reviews
+    review_summary, last_review_date = {}, None
+    reviews = await process_reviews(context)
+    if reviews and len(reviews) > 0:
+        review_summary = {
+            'total': len(reviews),
+            'avg_rating': sum(r['rating'] for r in reviews if r.get('rating')) / len([r for r in reviews if r.get('rating')]),
+            'sample': reviews[:3]
+        }
+        last_review_date = reviews[0]['date'] if reviews[0].get('date') else None
+
+    return {
+        'url': url,
+        'title': title,
+        'star': star,
+        'review_count': review_count,
+        'headline': headline,
+        'category': category,
+        'address': address,
+        'open_hours': open_hours,
+        'check_in': check_in,
+        'book': book,
+        'website': website,
+        'phone': phone,
+        'pluscode': pluscode,
+        'coordinates': coordinates,
+        'photos': photos,
+        'cover_photo': cover_photo,
+        'attributes': about_data.get('attributes', {}),
+        'services': about_data.get('services', []),
+        'email': about_data.get('email'),
+        'social_links': about_data.get('social_links', []),
+        'review_summary': review_summary,
+        'last_review_date': last_review_date,
+        'scraped_at': datetime.utcnow().isoformat(),
+    }
 
 async def process_about(page):
-  if not (await page.query_selector("button[aria-label*='About']")):
-    return None
-  await page.click("button[aria-label*='About']")
+    data = {
+        'about': [],
+        'attributes': {},
+        'services': [],
+        'email': None,
+        'social_links': []
+    }
 
-  if not (await page.query_selector("h2")):
-    return None
-  await page.wait_for_selector("h2", timeout=1000 * 10)
-        
-  list_of_el = await page.query_selector_all("div.fontBodyMedium")
-  data = {}
+    if not (await page.query_selector("button[aria-label*='About']")):
+        return data
 
-  # If there is only one element in the list
-  if len(list_of_el) == 1:
-    text = await page.evaluate("""
-      () => Array.from(document.querySelectorAll("div.P1LL5e")).map(el => el.innerText.trim())
-    """)
-    
-    attrs = await page.evaluate("""
-      () => Array.from(document.querySelectorAll("div.WKLD0c .CK16pd")).map(el => el.getAttribute("aria-label"))
-    """)
-    
-    return "\n".join(text) + "\n" + "\n".join(attrs)
-  
-  # Loop through each item in the list and extract details
-  for item in list_of_el:
-    h2_el = await item.query_selector("h2")
-    if not h2_el:
-      continue
+    await page.click("button[aria-label*='About']")
+    await page.wait_for_selector("h2", timeout=1000 * 10)
 
-    title = await h2_el.inner_text()
+    sections = await page.query_selector_all("div.fontBodyMedium")
 
-    texts = await item.query_selector_all("li")
-    items = []
+    for section in sections:
+        h2 = await section.query_selector("h2")
+        if not h2:
+            continue
+        heading = await h2.inner_text()
+        items = []
 
-    for t in texts:
-      span_el = await t.query_selector("span[aria-label]")
-      if span_el:
-        text = await span_el.get_attribute("aria-label")
-        items.append(text)
-    
-    data[title] = items
-  
-  return data
+        list_items = await section.query_selector_all("li")
+        for li in list_items:
+            span = await li.query_selector("span[aria-label]")
+            if span:
+                label = await span.get_attribute("aria-label")
+                items.append(label)
+
+        if heading == "About":
+            data['about'].extend(items)
+        elif heading == "Amenities" or heading == "Services":
+            data['services'].extend(items)
+        elif heading == "Accessibility" or heading == "Highlights":
+            data['attributes'][heading.lower()] = items
+
+    # 🔍 Extract email using regex from all visible text
+    try:
+        page_text = await page.inner_text("body")
+        email_match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", page_text)
+        if email_match:
+            data['email'] = email_match.group(0)
+    except Exception as e:
+        print(f"Error extracting email: {e}")
+
+    # 🔗 Extract social media links
+    try:
+        social_links = await page.evaluate("""
+            () => Array.from(document.querySelectorAll("a"))
+                .map(a => a.href)
+                .filter(href => 
+                    /twitter\\.com|x\\.com|facebook\\.com|linkedin\\.com|instagram\\.com|youtube\\.com|tiktok\\.com/.test(href)
+                )
+        """)
+        data['social_links'] = list(set(social_links))  # deduplicate
+    except Exception as e:
+        print(f"Error extracting social links: {e}")
+
+    return data
 
 async def process_reviews(context):
   page = context.page
