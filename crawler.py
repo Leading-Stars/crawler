@@ -51,7 +51,7 @@ async def process_business(context: PlaywrightCrawlingContext) -> dict:
     title_el = await page.query_selector("h1")
     title = await title_el.inner_text() if title_el else None
 
-    # Star rating & review count
+    # Star rating & Review count
     review_el = await page.query_selector("div.F7nice")
     star, review_count = None, None
     if review_el:
@@ -128,7 +128,7 @@ async def process_business(context: PlaywrightCrawlingContext) -> dict:
     # Cover Photo
     cover_photo = photos[0] if photos else ""
 
-    # About Section / Attributes
+    # Attributes / Services / Email / Social Links
     about_data = await process_about(page)
 
     # Reviews
@@ -167,7 +167,6 @@ async def process_business(context: PlaywrightCrawlingContext) -> dict:
         'last_review_date': last_review_date,
         'scraped_at': datetime.utcnow().isoformat(),
     }
-
 async def process_about(page):
     data = {
         'about': [],
