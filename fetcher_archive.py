@@ -4,14 +4,12 @@ import time
 import json
 from datetime import timedelta, datetime, timezone
 import requests
-import re
-from decimal import Decimal
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 from dotenv import load_dotenv
 from utils.enums import Status
 from utils.google_maps_utils import google_map_consent_check
-import tempfile
-import shutil
+import re
+from decimal import Decimal
 
 load_dotenv('.env')
 
@@ -25,41 +23,84 @@ if not TASK_SPREADER_API_URL:
 
 queries = {"country": COUNTRY, "machine_id": MACHINE_ID, "queries": []}
 
-# Set concurrency limits
+# Set max concurrency manually via semaphore
 MAX_CONCURRENCY = 2
 semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-
-# Email & Social Patterns
-EMAIL_PATTERN = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
-OBFUSCATED_EMAIL_PATTERN = r"([a-zA-Z0-9._%+-]+)\s*$$at$$\s*([a-zA-Z0-9.-]+)\s*$$dot$$\s*([a-zA-Z]{2,})"
-SOCIAL_DOMAINS = {
-    'twitter.com', 'x.com', 'facebook.com', 'linkedin.com',
-    'instagram.com', 'youtube.com', 'tiktok.com'
-}
 
 # Initialize crawler instance
 crawler = PlaywrightCrawler(
     request_handler_timeout=timedelta(minutes=10),
     max_request_retries=2,
 )
-
-def extract_emails(text):
-    """Extract both standard and obfuscated emails"""
-    matches = set(re.findall(EMAIL_PATTERN, text))
-    obfuscated_matches = [f"{m[0]}@{m[1]}.{m[2]}" for m in re.findall(OBFUSCATED_EMAIL_PATTERN, text)]
-    return list(matches.union(obfuscated_matches))
-
-async def safe_page_goto(context: PlaywrightCrawlingContext, url: str, timeout=90_000):
+async def main():
+    global queries
+    print("Fetcher started")
     try:
-        await context.page.goto(url, timeout=timeout)
-        return True
+        while True:
+            urls = get_queries_to_process()
+            if urls:
+                original_queries = {q['url']: q for q in queries['queries']}
+
+                # ❌ Remove parallel crawling
+                # Instead, run crawler once and pass all URLs
+                await crawler.run(urls)
+
+                # Merge metadata back
+                for query in queries['queries']:
+                    if query['url'] in original_queries:
+                        query.update({
+                            'id': original_queries[query['url']].get('id'),
+                            'metadata': original_queries[query['url']].get('metadata', {})
+                        })
+                push_results_to_db()
+            else:
+                print("No more URLs to process.")
+                await asyncio.sleep(60)
     except Exception as e:
-        context.log.error(f"Navigation to {url} timed out: {e}")
-        return False
+        error_msg = str(e)
+        if error_msg == "READ_TIMEOUT":
+            print("Script stopped due to READ_TIMEOUT.")
+        elif error_msg == "CONNECT_TIMEOUT":
+            print("Script stopped due to CONNECT_TIMEOUT.")
+        elif error_msg.startswith("REQUEST_FAILED"):
+            print(f"Script stopped: {error_msg}")
+        else:
+            print(f"Unexpected error: {error_msg}")
+        raise
+
+@crawler.router.default_handler
+async def request_handler(context: PlaywrightCrawlingContext) -> None:
+    url = context.request.url
+    status = Status.FAILED.value
+    context.log.info(f'Processing URL: {url}')
+    try:
+        # Navigate with longer timeout
+        await context.page.goto(url, timeout=90_000)
+
+        # Handle Google consent banner
+        await google_map_consent_check(context)
+
+        # Skip redirect pages
+        if context.page.url.startswith('https://consent.google.com/m?continue='):
+            return
+
+        data = await process_business(context)
+        if data and validate_result(data):
+            status = Status.PROCESSED.value
+            save_query_results(url, [data])
+        else:
+            context.log.warning(f"No valid data extracted from {url}")
+    except Exception as e:
+        context.log.error(f"Error processing page {url}: {e}")
+        status = Status.FAILED.value
+    finally:
+        update_query_status(url, status)
+
 
 async def process_business(context: PlaywrightCrawlingContext):
     page = context.page
     url = context.request.url
+
     result = {
         'title': None,
         'category': None,
@@ -123,59 +164,60 @@ async def process_business(context: PlaywrightCrawlingContext):
             # Fallback: scan body text
             try:
                 page_text = await page.inner_text("body")
-                emails = extract_emails(page_text)
-                if emails:
-                    result['email'] = emails[0]
+                email_match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", page_text)
+                if email_match:
+                    result['email'] = email_match.group(0)
             except Exception as e:
                 context.log.warning(f"Regex email extraction failed: {e}")
 
         # Social Links
-        all_links = await page.evaluate("Array.from(document.querySelectorAll('a')).map(a => a.href)")
-        result['social_links'] = [
-            link for link in all_links
-            if any(domain in link for domain in SOCIAL_DOMAINS)
-        ]
+        try:
+            links = await page.evaluate("""
+                () => Array.from(document.querySelectorAll("a"))
+                    .map(a => a.href)
+                    .filter(href => /twitter\\.com|x\\.com|facebook\\.com|linkedin\\.com|instagram\\.com|youtube\\.com|tiktok\\.com/.test(href))
+            """)
+            result['social_links'] = list(set(links))  # deduplicate
+        except Exception as e:
+            context.log.warning(f"Social link extraction failed: {e}")
 
         context.log.info(f"Scraped data: {result}")
         return result
+
     except Exception as e:
         context.log.error(f"Exception during scraping: {e}")
         return result
-    
-    finally:
-        #update_query_status(url, status)
-        await context.page.close()  # 👈 Add this line
 
-# === Utility Functions Below ===
+
+def validate_result(result):
+    if not result['title'] and not result['address'] and not result['website']:
+        return False
+    return True
+
 
 def parse_coordinate_from_map_url(url):
     try:
-        # Match format 1: /search/.../@lat,lng,zoom
-        match = re.search(r"@(-?\d+\.\d+),(-?\d+\.\d+)", url)
+        match = re.search(r'!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)', url)
         if match:
             return {
                 'latitude': float(match.group(1)),
                 'longitude': float(match.group(2))
             }
-        
-        # Match format 2: !3dlat!4dlng
-        match = re.search(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)", url)
-        if match:
-            return {
-                'latitude': float(match.group(1)),
-                'longitude': float(match.group(2))
-            }
-
         return None
     except Exception as e:
         print(f"Error parsing coordinates: {e}")
         return None
+
+
+# === Utility Functions Below ===
+
 def get_queries_to_process():
     global queries
     urls = get_queries_to_process_from_cache()
     if not urls:
         urls = get_queries_to_process_from_db()
     return urls
+
 
 def get_queries_to_process_from_db():
     global queries
@@ -217,6 +259,7 @@ def get_queries_to_process_from_db():
             print(f"[RequestException] {e}. Retrying in {delay}s...")
             time.sleep(delay)
 
+
 def get_queries_to_process_from_cache():
     global queries
     try:
@@ -240,12 +283,14 @@ def get_queries_to_process_from_cache():
     except FileNotFoundError:
         return None
 
+
 def get_query_from_queries(query_url):
     global queries
     for query in queries['queries']:
         if query_url == query['url']:
             return query
     raise Exception(f"Query {query_url} not found in queries")
+
 
 def update_query_status(query_url, status):
     global queries
@@ -256,13 +301,16 @@ def update_query_status(query_url, status):
     except Exception as e:
         print(f"[WARNING] Could not update status for {query_url}: {str(e)}")
 
+
 def save_query_results(query_url, links):
     query = get_query_from_queries(query_url)
     query['results'] = links
     cache_queries()
 
+
 def count_queries_results():
     return sum(len(q['results']) for q in queries['queries'] if q.get('status') == Status.PROCESSED.value)
+
 
 def push_results_to_db():
     global queries
@@ -320,81 +368,18 @@ def push_results_to_db():
             time.sleep(10 * (i + 1))
     raise Exception("Failed to push results to database after multiple attempts.")
 
+
 def cache_queries():
     global queries
-    with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+    with open('queries_cache.json', 'w') as f:
         json.dump(queries, f, indent=4)
-        temp_path = f.name
-    shutil.move(temp_path, 'queries_cache.json')
+
 
 def clear_queries():
     global queries
     queries['queries'] = []
     cache_queries()
 
-@crawler.router.default_handler
-async def request_handler(context: PlaywrightCrawlingContext) -> None:
-    async with semaphore:
-        url = context.request.url
-        status = Status.FAILED.value
-        context.log.info(f'Processing URL: {url}')
-        try:
-            if not await safe_page_goto(context, url):
-                return
-            # Handle Google consent banner
-            await google_map_consent_check(context)
-            # Skip redirect pages
-            if context.page.url.startswith('https://consent.google.com/m?continue='):
-                return
-            data = await process_business(context)
-            if data and validate_result(data):
-                status = Status.PROCESSED.value
-                save_query_results(url, [data])
-            else:
-                context.log.warning(f"No valid data extracted from {url}")
-        except Exception as e:
-            context.log.error(f"Error processing page {url}: {e}")
-            status = Status.FAILED.value
-        finally:
-            update_query_status(url, status)
-            await asyncio.sleep(1)  # Rate limiting
-
-def validate_result(result):
-    if not result['title'] and not result['address'] and not result['website']:
-        return False
-    return True
-
-async def main():
-    global queries
-    print("Fetcher started")
-    try:
-        while True:
-            urls = get_queries_to_process()
-            if urls:
-                original_queries = {q['url']: q for q in queries['queries']}
-                await crawler.run(urls)
-                # Merge metadata back
-                for query in queries['queries']:
-                    if query['url'] in original_queries:
-                        query.update({
-                            'id': original_queries[query['url']].get('id'),
-                            'metadata': original_queries[query['url']].get('metadata', {})
-                        })
-                push_results_to_db()
-            else:
-                print("No more URLs to process.")
-                await asyncio.sleep(60)
-    except Exception as e:
-        error_msg = str(e)
-        if error_msg == "READ_TIMEOUT":
-            print("Script stopped due to READ_TIMEOUT.")
-        elif error_msg == "CONNECT_TIMEOUT":
-            print("Script stopped due to CONNECT_TIMEOUT.")
-        elif error_msg.startswith("REQUEST_FAILED"):
-            print(f"Script stopped: {error_msg}")
-        else:
-            print(f"Unexpected error: {error_msg}")
-        raise
 
 if __name__ == "__main__":
     asyncio.run(main())

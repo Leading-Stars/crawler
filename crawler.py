@@ -1,16 +1,17 @@
 import re
-
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 from dotenv import load_dotenv
-
 from utils.enums import Status
 from utils.google_maps_utils import google_map_consent_check
 
 load_dotenv('.env')
 
+# Set concurrency manually via environment variable
+import os
+os.environ['CRAWLEE_MAX_CONCURRENCY'] = '2'  # 👈 Controls concurrency without AutoscaledPoolOptions
 
 # Add this near the top of the file after imports
 from crawlee.crawlers import PlaywrightCrawler
@@ -19,9 +20,8 @@ from datetime import timedelta
 # Initialize crawler instance
 crawler = PlaywrightCrawler(
     request_handler_timeout=timedelta(minutes=10),
-    max_request_retries=1
+    max_request_retries=2,
 )
-
 
 @crawler.router.default_handler
 async def request_handler(context: PlaywrightCrawlingContext) -> None:
